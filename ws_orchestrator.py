@@ -1,8 +1,11 @@
 import asyncio
 import json
+import os
 import time
 import random
 from datetime import datetime, timezone
+from http import HTTPStatus
+from pathlib import Path
 from typing import Set
 import websockets
 
@@ -10,12 +13,15 @@ from strategy_engine import StrategyConfig, XAUUSDScalpingEngine, Candle
 from tick_aggregator import MultiTimeframeAggregator
 from paper_broker import PaperMatchingBroker
 
+HOST_DOMAIN = "fi10.bot-hosting.cloud"
+HOST_PORT = int(os.environ.get("SERVER_PORT", 25644))
+
 
 class WebSocketOrchestrator:
     """
-    Asynchronous WebSocket Server & Market Stream Orchestrator.
-    - Broadcasts real-time telemetry, candles, bot state, and order lines to connected Web Chart clients on ws://localhost:8765
-    - Includes a built-in Realistic Market Feed Simulator (so you can test immediately) or connects to an external feed.
+    Asynchronous WebSocket & HTTP Server for fi10.bot-hosting.cloud:25644
+    - Serves dashboard.html directly when visiting http://fi10.bot-hosting.cloud:25644 in a browser
+    - Broadcasts real-time telemetry, candles, bot state, and order lines over ws://fi10.bot-hosting.cloud:25644
     """
     def __init__(self, config: StrategyConfig):
         self.cfg = config
@@ -24,7 +30,6 @@ class WebSocketOrchestrator:
         self.broker = PaperMatchingBroker(config, self.engine)
         self.connected_clients: Set = set()
 
-        # Seed initial historical data so M5 fractals and ATR are ready immediately
         self._seed_initial_market_history()
 
     def _seed_initial_market_history(self):
@@ -36,7 +41,6 @@ class WebSocketOrchestrator:
         dxy_m5_seed = []
         for i in range(40, 0, -1):
             ts = ((now - i * 300) // 300) * 300
-            # Create structured bullish wave on Gold & bearish wave on DXY
             wave = (40 - i) * 0.25 + (1.2 if i % 4 == 0 else -0.8)
             g_open = base_gold + wave
             g_close = g_open + (0.6 if i % 2 == 0 else -0.3)
@@ -58,10 +62,9 @@ class WebSocketOrchestrator:
             gold_m1_seed.append(Candle(ts, g_open, g_close + 0.4, g_open - 0.5, g_close))
         self.aggregator.seed_historical_candles("XAUUSD", "M1", gold_m1_seed)
 
-    async def register_client(self, websocket):
+    async def register_client(self, websocket, *args):
         self.connected_clients.add(websocket)
         try:
-            # Send initial history snapshot
             init_payload = {
                 "type": "INIT_SNAPSHOT",
                 "candles_s5": [c.to_dict() for c in self.aggregator.streams["XAUUSD"]["S5"].get_closed_candles()[-60:]],
@@ -76,7 +79,7 @@ class WebSocketOrchestrator:
             async for _ in websocket:
                 pass
         finally:
-            self.connected_clients.remove(websocket)
+            self.connected_clients.discard(websocket)
 
     async def broadcast(self, payload: dict):
         if not self.connected_clients:
@@ -91,12 +94,9 @@ class WebSocketOrchestrator:
         closed_flags = self.aggregator.on_tick(symbol, timestamp_sec, bid, ask)
 
         if symbol == "XAUUSD":
-            # 1. Run Broker Matching Engine on every Gold tick
             broker_event = self.broker.process_tick(timestamp_sec, bid, ask)
 
-            # 2. Evaluate Strategy Engine
             gmt_hour = datetime.fromtimestamp(timestamp_sec, tz=timezone.utc).hour
-            # If enforce_london_ny_window is False in simulation mode, pass 14 GMT so user can test any time
             effective_hour = gmt_hour if self.cfg.enforce_london_ny_window else 14
 
             decision = self.engine.evaluate(
@@ -141,26 +141,22 @@ class WebSocketOrchestrator:
             await self.broadcast(telemetry)
 
     async def run_simulated_market_stream(self):
-        """
-        Generates realistic high-frequency XAUUSD and DXY ticks (4 ticks/sec)
-        including micro-sweeps and exhaustion wicks so the entire pipeline can be tested live.
-        """
         gold_mid = 2662.50
         dxy_mid = 104.10
         tick_counter = 0
 
-        print("[*] Starting WebSocket Server on ws://localhost:8765")
-        print("[*] Streaming live XAUUSD & DXY ticks into Multi-Timeframe RAM Aggregator...")
+        print(f"[*] Live Dashboard URL : http://{HOST_DOMAIN}:{HOST_PORT}")
+        print(f"[*] WebSocket Endpoint : ws://{HOST_DOMAIN}:{HOST_PORT}")
+        print(f"[*] Listening on port  : {HOST_PORT}")
 
         while True:
             now = int(time.time())
             tick_counter += 1
 
-            # Create periodic micro-sweeps every ~25 seconds to trigger S5 exhaustion patterns
             if tick_counter % 100 in (85, 86, 87):
-                gold_mid -= 0.65  # Fast liquidity sweep down
+                gold_mid -= 0.65
             elif tick_counter % 100 in (88, 89, 90):
-                gold_mid += 0.75  # Fast rejection snap-back (creates long lower wick on S5)
+                gold_mid += 0.75
             else:
                 gold_mid += random.uniform(-0.18, 0.20)
 
@@ -176,8 +172,37 @@ class WebSocketOrchestrator:
             await asyncio.sleep(0.25)
 
 
+def serve_dashboard_http(first_arg, second_arg):
+    """
+    Compatible HTTP handler for both websockets <=13 (path, request_headers)
+    and websockets >=14 (connection, request) so opening http://fi10.bot-hosting.cloud:25644
+    directly in the browser renders dashboard.html!
+    """
+    try:
+        # Check if it's a WebSocket upgrade request
+        if hasattr(second_arg, "headers"):
+            # websockets >= 14
+            headers = second_arg.headers
+            if headers.get("Upgrade", "").lower() == "websocket":
+                return None
+            html_bytes = Path("dashboard.html").read_bytes()
+            return first_arg.respond(HTTPStatus.OK, html_bytes)
+        else:
+            # websockets <= 13
+            headers = second_arg
+            if headers.get("Upgrade", "").lower() == "websocket":
+                return None
+            html_bytes = Path("dashboard.html").read_bytes()
+            return (
+                HTTPStatus.OK,
+                [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(html_bytes)))],
+                html_bytes,
+            )
+    except Exception:
+        return None
+
+
 async def main():
-    # Set enforce_london_ny_window=False during local testing so you can test outside 13:00-17:00 GMT
     config = StrategyConfig(
         symbol="XAUUSD",
         fixed_lot=0.01,
@@ -186,7 +211,12 @@ async def main():
     )
     orchestrator = WebSocketOrchestrator(config)
 
-    async with websockets.serve(orchestrator.register_client, "0.0.0.0", 8765):
+    async with websockets.serve(
+        orchestrator.register_client,
+        "0.0.0.0",
+        HOST_PORT,
+        process_request=serve_dashboard_http
+    ):
         await orchestrator.run_simulated_market_stream()
 
 
