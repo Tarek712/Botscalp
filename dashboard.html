@@ -128,10 +128,7 @@
     }
 
     // Automatically connects to fi10.bot-hosting.cloud:25644 (works both via http://fi10.bot-hosting.cloud:25644 and local file)
-    const DEFAULT_HOST = 'fi10.bot-hosting.cloud:25644';
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const targetHost = (window.location.host && window.location.host.includes(':')) ? window.location.host : DEFAULT_HOST;
-    const wsUrl = `${wsProtocol}//${targetHost}`;
+    const wsUrl = 'wss://3aldgn1yxq.apps.bot-hosting.cloud';
 
     let ws = null;
     function connectWebSocket() {
